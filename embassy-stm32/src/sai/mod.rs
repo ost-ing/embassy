@@ -184,7 +184,6 @@ pub enum SyncInput {
     /// Syncs with the other A/B sub-block within the SAI unit
     Internal,
     /// Syncs with a sub-block in the other SAI unit
-    #[cfg(any(sai_v4_2pdm, sai_v4_4pdm))]
     External(SyncInputInstance),
 }
 
@@ -193,14 +192,12 @@ impl SyncInput {
         match self {
             SyncInput::None => vals::Syncen::ASYNCHRONOUS,
             SyncInput::Internal => vals::Syncen::INTERNAL,
-            #[cfg(any(sai_v4_2pdm, sai_v4_4pdm))]
             SyncInput::External(_) => vals::Syncen::EXTERNAL,
         }
     }
 }
 
 /// SAI instance to sync from.
-#[cfg(any(sai_v4_2pdm, sai_v4_4pdm))]
 #[derive(Copy, Clone, PartialEq)]
 #[allow(missing_docs)]
 pub enum SyncInputInstance {
@@ -697,18 +694,6 @@ fn get_ring_buffer<'d, T: Instance, W: word::Word>(
 fn update_synchronous_config(config: &mut Config) {
     config.mode = Mode::Slave;
     config.sync_output = false;
-
-    #[cfg(any(sai_v1, sai_v2, sai_v3_2pdm, sai_v3_4pdm))]
-    {
-        config.sync_input = SyncInput::Internal;
-    }
-
-    #[cfg(any(sai_v4_2pdm, sai_v4_4pdm))]
-    {
-        //this must either be Internal or External
-        //The asynchronous sub-block on the same SAI needs to enable sync_output
-        assert!(config.sync_input != SyncInput::None);
-    }
 }
 
 /// SAI subblock instance.
@@ -861,23 +846,20 @@ impl<'d, T: Instance, W: word::Word> Sai<'d, T, W> {
             ch.cr1().modify(|w| w.set_saien(false));
         }
 
-        #[cfg(any(sai_v4_2pdm, sai_v4_4pdm))]
-        {
-            if let SyncInput::External(i) = config.sync_input {
-                T::REGS.gcr().modify(|w| {
-                    w.set_syncin(i as u8);
-                });
-            }
+        if let SyncInput::External(i) = config.sync_input {
+            T::REGS.gcr().modify(|w| {
+                w.set_syncin(i as u8);
+            });
+        }
 
-            if config.sync_output {
-                let syncout: u8 = match sub_block {
-                    WhichSubBlock::A => 0b01,
-                    WhichSubBlock::B => 0b10,
-                };
-                T::REGS.gcr().modify(|w| {
-                    w.set_syncout(syncout);
-                });
-            }
+        if config.sync_output {
+            let syncout: u8 = match sub_block {
+                WhichSubBlock::A => 0b01,
+                WhichSubBlock::B => 0b10,
+            };
+            T::REGS.gcr().modify(|w| {
+                w.set_syncout(syncout);
+            });
         }
 
         #[cfg(any(sai_v1, sai_v2, sai_v3_2pdm, sai_v3_4pdm, sai_v4_2pdm, sai_v4_4pdm))]
