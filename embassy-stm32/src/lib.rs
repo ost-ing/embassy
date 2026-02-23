@@ -138,6 +138,8 @@ pub mod wdg;
 #[cfg(xspi)]
 pub mod xspi;
 
+pub mod mdma;
+
 #[cfg(feature = "low-power")]
 pub use low_power::Executor;
 
