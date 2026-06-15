@@ -203,21 +203,20 @@ pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
             while !ep_diepint.read().epdisd() {}
             ep_diepint.modify(|m| m.set_epdisd(true));
 
-            // Switch the packet polarity
-            ep_diepctl.modify(|r| {
-                if frame_is_odd {
-                    r.set_sd0pid_sevnfrm(true);
-                } else {
-                    r.set_soddfrm_sd1pid(true);
-                }
+            // Flush the TX FIFO for this endpoint
+            r.grstctl().modify(|w| {
+                w.set_txfnum(ep_num as _);
+                w.set_txfflsh(true);
             });
+            while r.grstctl().read().txfflsh() {}
 
-            // Enable the endpoint again
-            ep_diepctl.modify(|w| {
-                w.set_cnak(true);
-                w.set_epena(true);
-            });
+            // Wake the in_waker so write() sees epena=false and retries
+            // the full DIEPTSIZ + polarity + enable + FIFO write sequence
+            state.ep_states[ep_num].in_waker.wake();
         }
+
+        // Clear the EOPF flag (rc_w1)
+        r.gintsts().write(|w| w.set_eopf(true));
     }
 }
 
@@ -665,6 +664,7 @@ impl<'d> Bus<'d> {
             w.set_rxflvlm(true);
             w.set_srqim(true);
             w.set_otgint(true);
+            w.set_eopfm(true);
         });
     }
 
