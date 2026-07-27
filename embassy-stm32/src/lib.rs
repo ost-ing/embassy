@@ -651,7 +651,7 @@ mod dual_core {
         }
     }
 
-    fn init_secondary_hw(shared_data: &'static SharedData) -> Peripherals {
+    pub fn init_secondary_hw(shared_data: &'static SharedData) -> Peripherals {
         rcc::set_freqs_ptr(shared_data.clocks.get());
         #[cfg(feature = "low-power")]
         rcc::set_rcc_config_ptr(shared_data.rcc_config.get());
