@@ -517,6 +517,53 @@ impl<'d, T: Instance> Dma2d<'d, T> {
         Self::transfer().await
     }
 
+    /// Fill the output buffer with a color, blocking until complete.
+    /// Use this instead of `fill` when not running inside an async executor.
+    pub fn fill_blocking(&mut self, dest: &Region2D, color: u32) -> Result<(), Error> {
+        T::regs().opfccr().modify(|w| {
+            w.set_cm(dest.format.into());
+        });
+
+        self.set_region(BufferKind::Output, dest);
+        #[cfg(dma2d_v2)]
+        T::regs().ocolr().modify(|w| w.set_color(color));
+        #[cfg(dma2d_v1)]
+        T::regs().ocolr().modify(|w| w.0 = color);
+        T::regs().cr().modify(|w| w.set_mode(vals::Mode::RegisterToMemory));
+        Self::transfer_blocking()
+    }
+
+    /// Start a transfer and busy-wait for completion (no interrupts).
+    fn transfer_blocking() -> Result<(), Error> {
+        // Start the transfer
+        T::regs().cr().modify(|w| {
+            w.set_tcie(false);
+            w.set_teie(false);
+            w.set_ceie(false);
+            w.set_start(stm32_metapac::dma2d::vals::CrStart::Start);
+        });
+
+        // Spin until a completion or error flag is set
+        loop {
+            let isr = T::regs().isr().read();
+
+            if isr.teif() {
+                T::regs().ifcr().modify(|w| w.set_cteif(vals::Cteif::Clear));
+                return Err(Error::TransferError);
+            }
+
+            if isr.ceif() {
+                T::regs().ifcr().modify(|w| w.set_cceif(vals::Cceif::Clear));
+                return Err(Error::ConfigError);
+            }
+
+            if isr.tcif() {
+                T::regs().ifcr().modify(|w| w.set_ctcif(vals::Ctcif::Clear));
+                return Ok(());
+            }
+        }
+    }
+
     /// Start a transfer and wait for the completion interrupt
     async fn transfer() -> Result<(), Error> {
         poll_fn(|cx| {
