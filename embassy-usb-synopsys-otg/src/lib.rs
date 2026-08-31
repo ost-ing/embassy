@@ -28,6 +28,25 @@ pub mod host;
 
 use otg_v1::{Otg, regs, vals};
 
+/// Latched bus-event bits, set by [`on_interrupt`] and consumed by `Bus::poll`.
+///
+/// The ISR clears the hardware flag and records it here rather than masking the
+/// interrupt and leaving `Bus::poll` to unmask it. Masking made the driver's
+/// liveness depend on `Bus::poll` being polled promptly, which `UsbDevice` cannot
+/// guarantee: it awaits `handle_control` outside the `select` that drives the bus
+/// future, so a control transfer the host abandons mid-flight left the bus
+/// interrupts masked forever and the driver deaf until reset.
+/// Bound on the register handshakes in [`Bus::abort_armed_in_endpoints`]. With no bus the
+/// core may never assert them, and this runs on the event path, so it must not spin forever.
+const HANDSHAKE_SPINS: u32 = 100_000;
+
+const EV_SRQINT: u32 = 1 << 0;
+const EV_SEDET: u32 = 1 << 1;
+const EV_USBRST: u32 = 1 << 2;
+const EV_ENUMDNE: u32 = 1 << 3;
+const EV_USBSUSP: u32 = 1 << 4;
+const EV_WKUPINT: u32 = 1 << 5;
+
 /// Handle interrupts.
 pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
     trace!("irq");
@@ -35,12 +54,48 @@ pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
 
     let ints = r.gintsts().read();
     if ints.wkupint() || ints.usbsusp() || ints.usbrst() || ints.enumdne() || ints.otgint() || ints.srqint() {
-        // Mask interrupts and notify `Bus` to process them
-        r.gintmsk().write(|w| {
-            w.set_iepint(true);
-            w.set_oepint(true);
-            w.set_rxflvlm(true);
-        });
+        // Clear each flag and latch it for `Bus::poll`. GINTSTS is rc_w1, so a
+        // `write` clears only the bits set here and leaves the rest pending.
+        let mut ev = 0;
+        if ints.srqint() {
+            ev |= EV_SRQINT;
+            r.gintsts().write(|w| w.set_srqint(true));
+        }
+        if ints.otgint() {
+            let otgints = r.gotgint().read();
+            r.gotgint().write_value(otgints);
+            if otgints.sedet() {
+                ev |= EV_SEDET;
+            }
+        }
+        if ints.usbrst() {
+            ev |= EV_USBRST;
+            r.gintsts().write(|w| w.set_usbrst(true));
+
+            // A reset invalidates every transfer in flight. Bump the generation and wake
+            // the waiters so they fail here rather than parking on a host that has gone
+            // away -- otherwise `handle_control` never returns, and `UsbDevice` awaits it
+            // outside the `select` that drives `Bus::poll`, so the reset below is never
+            // acted on. `Bus::poll` re-arms the endpoints via `configure_endpoints`.
+            for ep in state.ep_states {
+                ep.reset_gen.fetch_add(1, Ordering::Release);
+                ep.in_waker.wake();
+                ep.out_waker.wake();
+            }
+        }
+        if ints.enumdne() {
+            ev |= EV_ENUMDNE;
+            r.gintsts().write(|w| w.set_enumdne(true));
+        }
+        if ints.usbsusp() {
+            ev |= EV_USBSUSP;
+            r.gintsts().write(|w| w.set_usbsusp(true));
+        }
+        if ints.wkupint() {
+            ev |= EV_WKUPINT;
+            r.gintsts().write(|w| w.set_wkupint(true));
+        }
+        state.bus_events.fetch_or(ev, Ordering::Release);
         state.bus_waker.wake();
     }
 
@@ -270,6 +325,11 @@ const EP_OUT_BUFFER_EMPTY: u16 = u16::MAX;
 struct EpState {
     in_waker: AtomicWaker,
     out_waker: AtomicWaker,
+    /// Bumped by the ISR on USB reset. A transfer captures it on entry and gives up if it
+    /// moves, which is the only way to abort an in-flight EP0 transfer: `USBAEP` in
+    /// `DIEPCTL0`/`DOEPCTL0` is read-only and always set, so the `usbaep` check that
+    /// unsticks EP1+ can never fire for the control pipe.
+    reset_gen: AtomicU32,
     /// RX FIFO is shared so extra buffers are needed to dequeue all data without waiting on each endpoint.
     /// Buffers are ready when associated [State::ep_out_size] != [EP_OUT_BUFFER_EMPTY].
     out_buffer: UnsafeCell<*mut u8>,
@@ -306,6 +366,7 @@ pub struct State<'d> {
     cp_state: &'d ControlPipeSetupState,
     ep_states: &'d [EpState],
     bus_waker: &'d AtomicWaker,
+    bus_events: &'d AtomicU32,
 }
 
 impl State<'_> {
@@ -375,6 +436,7 @@ pub struct StateStorage<const EP_COUNT: usize> {
     cp_state: ControlPipeSetupState,
     ep_states: [EpState; EP_COUNT],
     bus_waker: AtomicWaker,
+    bus_events: AtomicU32,
 }
 
 impl<const EP_COUNT: usize> StateStorage<EP_COUNT> {
@@ -389,6 +451,7 @@ impl<const EP_COUNT: usize> StateStorage<EP_COUNT> {
                 EpState {
                     in_waker: AtomicWaker::new(),
                     out_waker: AtomicWaker::new(),
+                    reset_gen: AtomicU32::new(0),
                     out_buffer: UnsafeCell::new(0 as _),
                     out_size: AtomicU16::new(EP_OUT_BUFFER_EMPTY),
                     in_alloc: UnsafeCell::new(None),
@@ -396,6 +459,7 @@ impl<const EP_COUNT: usize> StateStorage<EP_COUNT> {
                 }
             }; EP_COUNT],
             bus_waker: AtomicWaker::new(),
+            bus_events: AtomicU32::new(0),
         }
     }
 
@@ -405,6 +469,7 @@ impl<const EP_COUNT: usize> StateStorage<EP_COUNT> {
             cp_state: &self.cp_state,
             ep_states: self.ep_states.as_slice(),
             bus_waker: &self.bus_waker,
+            bus_events: &self.bus_events,
         }
     }
 }
@@ -973,6 +1038,53 @@ impl<'d> Bus<'d> {
         });
     }
 
+    /// Abort any IN transfer still armed, so a later `write()` is not left waiting on it.
+    ///
+    /// `EPENA` is set by software and cleared by *hardware* on transfer completion, so
+    /// writing 0 in `configure_endpoints` does not clear it. A transfer the host abandoned
+    /// therefore stays armed across the reset, and every subsequent `write()` on that
+    /// endpoint blocks in its first `poll_fn` waiting for `!epena()`. On EP0 that means the
+    /// SET_ADDRESS status stage never goes out: the device is addressed, the host never
+    /// advances, and enumeration fails identically forever until the chip is reset.
+    ///
+    /// Runs from `Bus::poll` rather than the ISR because it needs register handshakes.
+    fn abort_armed_in_endpoints(&mut self) {
+        let regs = self.instance.regs;
+
+        for index in 0..self.instance.state.endpoint_count() {
+            if !regs.diepctl(index).read().epena() {
+                continue;
+            }
+            trace!("aborting armed IN transfer on ep={}", index);
+
+            let spin = |cond: &dyn Fn() -> bool| {
+                let mut n = 0;
+                while !cond() && n < HANDSHAKE_SPINS {
+                    n += 1;
+                }
+                if n == HANDSHAKE_SPINS {
+                    warn!("timeout aborting IN ep={}", index);
+                }
+            };
+
+            regs.diepctl(index).modify(|w| w.set_snak(true));
+            spin(&|| regs.diepint(index).read().inepne());
+
+            regs.diepctl(index).modify(|w| {
+                w.set_snak(true);
+                w.set_epdis(true);
+            });
+            spin(&|| regs.diepint(index).read().epdisd());
+            regs.diepint(index).modify(|w| w.set_epdisd(true));
+
+            regs.grstctl().modify(|w| {
+                w.set_txfnum(index as _);
+                w.set_txfflsh(true);
+            });
+            spin(&|| !regs.grstctl().read().txfflsh());
+        }
+    }
+
     fn disable_all_endpoints(&mut self) {
         let st = self.instance.state;
         for i in 0..st.endpoint_count() {
@@ -1009,38 +1121,41 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
             }
 
             let regs = self.instance.regs;
-            self.instance.state.bus_waker.register(cx.waker());
+            let st = self.instance.state;
 
-            let ints = regs.gintsts().read();
+            // Register before reading the latch, so an event landing between the
+            // read and the return still wakes us.
+            st.bus_waker.register(cx.waker());
 
-            if ints.srqint() {
+            // Events are latched and cleared by the ISR. Take one bit at a time and
+            // leave the rest pending: `poll` reports a single event per call, and
+            // `UsbDevice` loops back round for the next one.
+            let ev = st.bus_events.load(Ordering::Acquire);
+
+            if ev & EV_SRQINT != 0 {
+                st.bus_events.fetch_and(!EV_SRQINT, Ordering::AcqRel);
                 trace!("vbus detected");
-
-                regs.gintsts().write(|w| w.set_srqint(true)); // clear
-                self.restore_irqs();
 
                 if self.config.vbus_detection {
                     return Poll::Ready(Event::PowerDetected);
                 }
             }
 
-            if ints.otgint() {
-                let otgints = regs.gotgint().read();
-                regs.gotgint().write_value(otgints); // clear all
-                self.restore_irqs();
+            if ev & EV_SEDET != 0 {
+                st.bus_events.fetch_and(!EV_SEDET, Ordering::AcqRel);
+                trace!("vbus removed");
 
-                if otgints.sedet() {
-                    trace!("vbus removed");
-                    if self.config.vbus_detection {
-                        self.disable_all_endpoints();
-                        return Poll::Ready(Event::PowerRemoved);
-                    }
+                if self.config.vbus_detection {
+                    self.disable_all_endpoints();
+                    return Poll::Ready(Event::PowerRemoved);
                 }
             }
 
-            if ints.usbrst() {
+            if ev & EV_USBRST != 0 {
+                st.bus_events.fetch_and(!EV_USBRST, Ordering::AcqRel);
                 trace!("reset");
 
+                self.abort_armed_in_endpoints();
                 self.init_fifo();
                 self.configure_endpoints();
 
@@ -1050,12 +1165,10 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
                         w.set_dad(0);
                     });
                 });
-
-                regs.gintsts().write(|w| w.set_usbrst(true)); // clear
-                self.restore_irqs();
             }
 
-            if ints.enumdne() {
+            if ev & EV_ENUMDNE != 0 {
+                st.bus_events.fetch_and(!EV_ENUMDNE, Ordering::AcqRel);
                 trace!("enumdne");
 
                 let speed = regs.dsts().read().enumspd();
@@ -1063,23 +1176,18 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
                 trace!("  speed={} trdt={}", speed.to_bits(), trdt);
                 regs.gusbcfg().modify(|w| w.set_trdt(trdt));
 
-                regs.gintsts().write(|w| w.set_enumdne(true)); // clear
-                self.restore_irqs();
-
                 return Poll::Ready(Event::Reset);
             }
 
-            if ints.usbsusp() {
+            if ev & EV_USBSUSP != 0 {
+                st.bus_events.fetch_and(!EV_USBSUSP, Ordering::AcqRel);
                 trace!("suspend");
-                regs.gintsts().write(|w| w.set_usbsusp(true)); // clear
-                self.restore_irqs();
                 return Poll::Ready(Event::Suspend);
             }
 
-            if ints.wkupint() {
+            if ev & EV_WKUPINT != 0 {
+                st.bus_events.fetch_and(!EV_WKUPINT, Ordering::AcqRel);
                 trace!("resume");
-                regs.gintsts().write(|w| w.set_wkupint(true)); // clear
-                self.restore_irqs();
                 return Poll::Ready(Event::Resume);
             }
 
@@ -1331,9 +1439,15 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("read start len={}", buf.len());
 
+        let entry_gen = self.state.reset_gen.load(Ordering::Acquire);
         poll_fn(|cx| {
             let index = self.info.addr.index();
             self.state.out_waker.register(cx.waker());
+
+            if self.state.reset_gen.load(Ordering::Acquire) != entry_gen {
+                trace!("read ep={:?} aborted by bus reset", self.info.addr);
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
 
             let doepctl = self.regs.doepctl(index).read();
             trace!("read ep={:?}: doepctl {:08x}", self.info.addr, doepctl.0,);
@@ -1403,9 +1517,15 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
         }
 
         let index = self.info.addr.index();
+        let entry_gen = self.state.reset_gen.load(Ordering::Acquire);
         // Wait for previous transfer to complete and check if endpoint is disabled
         poll_fn(|cx| {
             self.state.in_waker.register(cx.waker());
+
+            if self.state.reset_gen.load(Ordering::Acquire) != entry_gen {
+                trace!("write ep={:?} aborted by bus reset", self.info.addr);
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
 
             let diepctl = self.regs.diepctl(index).read();
             let dtxfsts = self.regs.dtxfsts(index).read();
@@ -1430,6 +1550,11 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
             poll_fn(|cx| {
                 self.state.in_waker.register(cx.waker());
 
+                if self.state.reset_gen.load(Ordering::Acquire) != entry_gen {
+                    trace!("write ep={:?} aborted by bus reset", self.info.addr);
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+
                 let size_words = (buf.len() + 3) / 4;
 
                 let fifo_space = self.regs.dtxfsts(index).read().ineptfsav() as usize;
@@ -1446,10 +1571,10 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
                     Poll::Pending
                 } else {
                     trace!("write ep={:?} wait for fifo: ready", self.info.addr);
-                    Poll::Ready(())
+                    Poll::Ready(Ok(()))
                 }
             })
-            .await
+            .await?;
         }
 
         // ERRATA: Transmit data FIFO is corrupted when a write sequence to the FIFO is interrupted with
