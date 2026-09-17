@@ -519,23 +519,40 @@ impl<'d, T: Instance> Dma2d<'d, T> {
 
     /// Fill the output buffer with a color, blocking until complete.
     /// Use this instead of `fill` when not running inside an async executor.
-    pub fn fill_blocking(&mut self, dest: &Region2D, color: u32) -> Result<(), Error> {
-        T::regs().opfccr().modify(|w| {
-            w.set_cm(dest.format.into());
+    pub fn fill_blocking(
+        &mut self,
+        dest: &Region2D,
+        color: u32,
+        format: PixelFormat,
+        swap_bytes: bool,
+    ) -> Result<(), Error> {
+        T::regs().opfccr().write(|w| {
+            w.set_cm(format.into());
+            #[cfg(dma2d_v2)]
+            w.set_sb(match swap_bytes {
+                true => vals::Sb::SwapBytes,
+                false => vals::Sb::Regular,
+            });
         });
-
         self.set_region(BufferKind::Output, dest);
         #[cfg(dma2d_v2)]
-        T::regs().ocolr().modify(|w| w.set_color(color));
+        T::regs().ocolr().write(|w| w.set_color(color));
         #[cfg(dma2d_v1)]
-        T::regs().ocolr().modify(|w| w.0 = color);
+        T::regs().ocolr().write(|w| w.0 = color);
         T::regs().cr().modify(|w| w.set_mode(vals::Mode::RegisterToMemory));
         Self::transfer_blocking()
     }
 
     /// Start a transfer and busy-wait for completion (no interrupts).
     fn transfer_blocking() -> Result<(), Error> {
-        // Start the transfer
+        // Clear all ISR flags from any previous transfer before starting
+        T::regs().ifcr().write(|w| {
+            w.set_ctcif(vals::Ctcif::Clear);
+            w.set_cteif(vals::Cteif::Clear);
+            w.set_cceif(vals::Cceif::Clear);
+        });
+
+        // Start the transfer with interrupts disabled
         T::regs().cr().modify(|w| {
             w.set_tcie(false);
             w.set_teie(false);
@@ -548,17 +565,17 @@ impl<'d, T: Instance> Dma2d<'d, T> {
             let isr = T::regs().isr().read();
 
             if isr.teif() {
-                T::regs().ifcr().modify(|w| w.set_cteif(vals::Cteif::Clear));
+                T::regs().ifcr().write(|w| w.set_cteif(vals::Cteif::Clear));
                 return Err(Error::TransferError);
             }
 
             if isr.ceif() {
-                T::regs().ifcr().modify(|w| w.set_cceif(vals::Cceif::Clear));
+                T::regs().ifcr().write(|w| w.set_cceif(vals::Cceif::Clear));
                 return Err(Error::ConfigError);
             }
 
             if isr.tcif() {
-                T::regs().ifcr().modify(|w| w.set_ctcif(vals::Ctcif::Clear));
+                T::regs().ifcr().write(|w| w.set_ctcif(vals::Ctcif::Clear));
                 return Ok(());
             }
         }

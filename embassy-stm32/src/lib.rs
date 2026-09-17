@@ -651,6 +651,11 @@ mod dual_core {
         }
     }
 
+    /// Initialize the `embassy-stm32` HAL from an already-initialized [SharedData], skipping the
+    /// HSEM handshake that [init_secondary] performs.
+    ///
+    /// This is the hardware half of [try_init_secondary]. Call it directly only when the caller has
+    /// established by other means that the other core has finished [init_primary].
     pub fn init_secondary_hw(shared_data: &'static SharedData) -> Peripherals {
         rcc::set_freqs_ptr(shared_data.clocks.get());
         #[cfg(feature = "low-power")]
